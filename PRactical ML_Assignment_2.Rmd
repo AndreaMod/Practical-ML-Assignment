@@ -1,0 +1,214 @@
+---
+title: "Practical ML - Assignment"
+author: "Andrea Modini"
+date: "23 settembre 2016"
+output: html_document
+---
+
+###Problem description
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+##Data Sources
+The training data for this project are available here:
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here:
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+##Load Libraries
+Load required libraries
+```{r,message=FALSE}
+library(caret)
+library(mice)
+library(reshape2)
+library(VIM)
+library(randomForest)
+library(gbm)
+```
+
+##Load Data and Split Data 
+Load Data and split training set in two groups 90%-10%, the first one for training and the second for testing models
+```{r}
+training=read.csv("pml-training.csv",na.strings=c("NA","#DIV/0!","","NULL"))
+testing=read.csv("pml-testing.csv",na.strings=c("NA","#DIV/0!","","NULL"))
+
+training_old=training
+
+set.seed(1234)
+training_flag = createDataPartition(training$classe, p=0.9, list=FALSE)
+training = training[training_flag, ]
+training_validate = training[-training_flag, ]
+
+dim(training)
+dim(training_validate)
+dim(testing)
+```
+
+##Data Cleaning
+Check Missing Data distribution
+```{r,warning=FALSE}
+missTable=as.data.frame(md.pattern(training)) 
+
+
+mice_plot=aggr(training,col=c("navyblue","yellow"),
+               numbers=TRUE,
+               sortVars=TRUE,
+               labels=names(training), 
+               cex.axis=.5, 
+               gap=1, 
+               ylab=c("Missing data", "Pattern"),
+               combined=TRUE)
+```
+
+
+There is a big group of variables with a huge number of NAs, lets remove that variables. Then remove unrelevant variables and variables with a variance close to zero.
+```{r, eval=FALSE}
+#Clean 1 exclude NA >90%
+training_app=training
+
+for(i in 1:length(training)) { 
+        if (sum(is.na( training[, i] ))/nrow(training) >= .9 ) { 
+        training_app=training_app[,-i]
+        } 
+    }
+
+training=training_app
+
+#Clean 2 exclude unrelevant vars
+exclude.var = c('X', 'user_name', 'raw_timestamp_part_1', 'raw_timestamp_part_2', 'cvtd_timestamp', 'new_window', 'num_window')
+training = training[, -which(names(training) %in% exclude.var)]
+
+
+#Check Zero var
+lowVar= nearZeroVar(training[sapply(training, is.numeric)], saveMetrics = TRUE)
+toremove=names(training[sapply(training, is.numeric)][,lowVar[,4]==TRUE])
+training = training[,-which(names(training) %in% toremove)]
+```
+
+Lets fill remeaning NAs with multiple imputation.
+```{r, eval=FALSE}
+#Preprocess, fill NA
+set.seed(1981)
+imputed=complete(mice(training))
+training=imputed
+
+for (k in 1:nrow(training)) {
+  v=training[k,]
+  v[which(v=="Inf")]=0
+  v[which(v=="-Inf")]=0
+  v[is.na(v)]=0
+  v[which(v=="NaN")]=0
+  training[k,]=v
+}
+
+#save.image("WorkingSpace_PracticalML_1.RData")
+```
+
+
+```{r,echo=FALSE}
+load("WorkingSpace_PracticalML_1.RData")
+```
+
+##Correlation Analysis
+Check correlation between remeaning variables
+```{r,warning=FALSE}
+cormat= round(cor(na.omit(training[sapply(training, is.numeric)])),2)
+melted_cormat=melt(cormat)
+
+ggplot(data=melted_cormat,aes(x=Var1,y=Var2,fill=value)) + geom_tile(color="white") + scale_fill_gradient2(low="blue",high="red",mid="white",midpoint=0,limit=c(-1,1),space="Lab", name="Correlation") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Correlation map is acceptable for machine learning algorithm. There are only small spots with high absolute correlation
+Lets build a GBM and a RF model, tuning parameters with 3-fold cross-validation. 
+```{r, eval=FALSE}
+Control = trainControl(method='repeatedcv', number = 3, repeats=1, verboseIter=TRUE)
+
+tGrid_gbm = expand.grid(.interaction.depth = seq(2,8,1),.n.trees=seq(50,550,50),.shrinkage=c(0.01,0.05,0.1),.n.minobsinnode=5) 
+Gbm = train(classe ~ ., data=training, trControl=Control, tuneGrid = tGrid_gbm,  method='gbm')
+
+
+#tGrid_rf <- expand.grid(.mtry =seq(4,14,1)) #mtry=14
+tGrid_rf <- expand.grid(.mtry =seq(10,20,1)) #mtry=19
+Rf = train(classe ~ ., data=training, trControl=Control, tuneGrid = tGrid_rf, method='rf', ntree=1000)
+
+#save.image("WorkingSpace_PracticalML_2.RData")
+```
+
+The result are two models, GBM and RF, tuned with 3-fold cross-validation
+Resulting parameters are:
+GBM: interaction.depth=7, n.trees=550, shrinkage=0.1, n.minobsinnode=5
+RF: mtry=19, ntree=1000
+
+```{r,echo=FALSE}
+load("WorkingSpace_PracticalML_2.RData")
+```
+
+Now lets adjust testing set (for model evaluation on training set)
+```{r}
+training_validate= training_validate[,which(names(training_validate) %in% names(training))]
+
+for (i in 1:length(training_validate) ) {
+        for(j in 1:length(training)) {
+        if( length( grep(names(training[i]), names(training_validate)[j]) ) ==1)  {
+            class(training_validate[j]) <- class(training[i])
+        }      
+    }      
+}
+
+for (k in 1:nrow(training_validate)) {
+  v=training_validate[k,]
+  v[which(v=="Inf")]=0
+  v[which(v=="-Inf")]=0
+  v[is.na(v)]=0
+  v[which(v=="NaN")]=0
+  training_validate[k,]=v
+}
+```
+
+Model Performances on a portion of training set reserved for evaluation
+```{r}
+Gbm.pred= predict(Gbm, newdata=training_validate)
+Gbm.matrix=confusionMatrix(Gbm.pred, training_validate$classe)
+Gbm.matrix
+
+Rf.pred= predict(Rf, newdata=training_validate)
+Rf.matrix= confusionMatrix(Rf.pred, training_validate$classe)
+Rf.matrix
+```
+
+Performances are very good.
+GBM Accuracy : 98%
+RF Accuracy : 100%
+Lets see most important variables for the best model
+```{r}
+best_model= Rf
+top <- varImp(best_model)
+top$importance$Overall <- sort(top$importance$Overall, decreasing=TRUE)
+best_vars= data.frame(Feature=row.names(top$importance),Importance=top$importance$Overall)
+best_vars
+```
+
+Now lets adjust testing set for blind prediction
+```{r}
+testing= testing[,which(names(testing) %in% names(training))]
+
+for (i in 1:length(testing) ) {
+        for(j in 1:length(training)) {
+        if( length( grep(names(training[i]), names(testing)[j]) ) ==1)  {
+            class(testing[j]) <- class(training[i])
+        }      
+    }      
+}
+
+for (k in 1:nrow(testing)) {
+  v=testing[k,]
+  v[which(v=="Inf")]=0
+  v[which(v=="-Inf")]=0
+  v[is.na(v)]=0
+  v[which(v=="NaN")]=0
+  testing[k,]=v
+}
+
+Rf.pred.test= predict(Rf, newdata=testing)
+Rf.pred.test
+```
